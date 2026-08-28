@@ -1,376 +1,969 @@
 import streamlit as st
+import pandas as pd
 import plotly.express as px
 
-from preprocessing import preprocess_data
+from database.repository import get_cases
+from ml.predict import predict_dataframe
 
-# =====================================================
-# LOAD DATA
-# =====================================================
 
-df = preprocess_data('cleaned_cases.csv')
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 
-# =====================================================
-# PAGE TITLE
-# =====================================================
-
-st.title('🏛 Court Efficiency Analysis')
-
-st.markdown(
-    '### Active Court Performance & Delay Analytics'
+st.set_page_config(
+    page_title="Court Performance",
+    page_icon="🏛️",
+    layout="wide"
 )
 
-# =====================================================
-# REMOVE INACTIVE STAGES
-# =====================================================
 
-inactive_stages = [
+# ============================================================
+# TITLE
+# ============================================================
 
-    'Disposed',
-    'Disposed Otherwise',
-    'Dismissed',
-    'Dismissed For Default',
-    'Closed',
-    'Judgment'
+st.title(
+    "🏛️ Court Performance Analysis"
+)
 
-]
+st.markdown(
+    "### Comparing court workload, predicted delay risk and case duration"
+)
 
-# =====================================================
-# ACTIVE CASES ONLY
-# =====================================================
+st.caption(
+    "Court-level performance is analyzed using PostgreSQL case data "
+    "and XGBoost predictions."
+)
 
-active_df = df[
-    ~df['stage_of_case']
-    .isin(inactive_stages)
-]
 
-# =====================================================
-# REMOVE INVALID DELAYS
-# =====================================================
+# ============================================================
+# LOAD DATA
+# ============================================================
 
-active_df = active_df[
-    active_df['case_age_days'] > 0
-]
+@st.cache_data(ttl=30)
+def load_cases():
+    return get_cases()
 
-# =====================================================
-# HANDLE HEARING GAPS
-# =====================================================
 
-valid_gaps = active_df[
-    active_df['hearing_gap_days'] > 0
-]
+try:
 
-if len(valid_gaps) > 0:
+    df = load_cases()
 
-    median_gap = valid_gaps[
-        'hearing_gap_days'
-    ].median()
+except Exception as exc:
+
+    st.error(
+        "Unable to connect to PostgreSQL."
+    )
+
+    st.exception(exc)
+
+    st.stop()
+
+
+if df.empty:
+
+    st.warning(
+        "No cases found in PostgreSQL."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# ML PREDICTIONS
+# ============================================================
+
+try:
+
+    df = predict_dataframe(df)
+
+except Exception as exc:
+
+    st.error(
+        "XGBoost models are not available."
+    )
+
+    st.code(
+        "python -m ml.train"
+    )
+
+    st.exception(exc)
+
+    st.stop()
+
+
+# ============================================================
+# CLEAN DATA
+# ============================================================
+
+for column in [
+    "court_name",
+    "district_name",
+    "stage_of_case",
+    "predicted_risk"
+]:
+
+    if column in df.columns:
+
+        df[column] = (
+            df[column]
+            .fillna("Unknown")
+            .astype(str)
+        )
+
+
+df["predicted_duration_years"] = pd.to_numeric(
+    df["predicted_duration_years"],
+    errors="coerce"
+).fillna(0)
+
+
+if "risk_probability_high" in df.columns:
+
+    df["high_risk_probability"] = pd.to_numeric(
+        df["risk_probability_high"],
+        errors="coerce"
+    ).fillna(0)
 
 else:
 
-    median_gap = 30
+    df["high_risk_probability"] = 0.0
 
-active_df['hearing_gap_days'] = active_df[
-    'hearing_gap_days'
-].replace(0, median_gap)
 
-# =====================================================
-# COURT ANALYTICS
-# =====================================================
+df["case_age_days"] = pd.to_numeric(
+    df.get("case_age_days", 0),
+    errors="coerce"
+).fillna(0)
+
+
+df["hearing_gap_days"] = pd.to_numeric(
+    df.get("hearing_gap_days", 0),
+    errors="coerce"
+).fillna(0)
+
+
+# ============================================================
+# ACTIVE CASES
+# ============================================================
+
+inactive_statuses = {
+    "DISPOSED",
+    "CLOSED",
+    "DISMISSED"
+}
+
+
+if "case_status" in df.columns:
+
+    active_df = df[
+        ~df["case_status"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .isin(inactive_statuses)
+    ].copy()
+
+else:
+
+    active_df = df.copy()
+
+
+if active_df.empty:
+
+    st.warning(
+        "No active cases available for court performance analysis."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# SIDEBAR FILTERS
+# ============================================================
+
+st.sidebar.header(
+    "🔎 Filters"
+)
+
+
+districts = sorted(
+    active_df["district_name"]
+    .unique()
+    .tolist()
+)
+
+
+selected_district = st.sidebar.selectbox(
+    "District",
+    ["All"] + districts
+)
+
+
+if selected_district != "All":
+
+    active_df = active_df[
+        active_df["district_name"]
+        ==
+        selected_district
+    ].copy()
+
+
+if active_df.empty:
+
+    st.warning(
+        "No active cases match the selected district."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# COURT STATISTICS
+# ============================================================
 
 court_stats = (
 
-    active_df.groupby('court_name')
-    .agg({
+    active_df
 
-        'case_age_days': 'mean',
+    .groupby("court_name")
 
-        'hearing_gap_days': 'mean',
+    .agg(
 
-        'priority_score': 'mean'
+        total_cases=(
+            "case_id",
+            "count"
+        ),
 
-    })
+        high_risk_cases=(
+            "predicted_risk",
+            lambda x:
+            (x == "High").sum()
+        ),
+
+        average_high_risk_probability=(
+            "high_risk_probability",
+            "mean"
+        ),
+
+        average_predicted_duration=(
+            "predicted_duration_years",
+            "mean"
+        ),
+
+        average_case_age=(
+            "case_age_days",
+            "mean"
+        ),
+
+        average_hearing_gap=(
+            "hearing_gap_days",
+            "mean"
+        )
+    )
+
     .reset_index()
+)
+
+
+# ============================================================
+# HIGH-RISK RATE
+# ============================================================
+
+court_stats["high_risk_rate"] = (
+
+    court_stats["high_risk_cases"]
+
+    /
+
+    court_stats["total_cases"]
+
+).fillna(0)
+
+
+# ============================================================
+# PERFORMANCE INDEX
+# ============================================================
+#
+# This is a simple analytical index:
+#
+# - lower high-risk rate = better
+# - lower predicted duration = better
+#
+# It is NOT a judicial quality score.
+#
+
+max_duration = (
+    court_stats[
+        "average_predicted_duration"
+    ].max()
+)
+
+
+if max_duration > 0:
+
+    duration_component = (
+
+        1
+        -
+        (
+            court_stats[
+                "average_predicted_duration"
+            ]
+            /
+            max_duration
+        )
+
+    )
+
+else:
+
+    duration_component = 1.0
+
+
+risk_component = (
+    1
+    -
+    court_stats[
+        "high_risk_rate"
+    ]
+)
+
+
+court_stats[
+    "performance_index"
+] = (
+
+    (
+        risk_component
+        +
+        duration_component
+    )
+    / 2
+
+) * 100
+
+
+# ============================================================
+# DISPLAY VALUES
+# ============================================================
+
+court_stats[
+    "average_high_risk_probability"
+] = (
+
+    court_stats[
+        "average_high_risk_probability"
+    ] * 100
 
 )
 
-# =====================================================
-# CASE COUNTS
-# =====================================================
 
-case_counts = (
+court_stats[
+    "high_risk_rate"
+] = (
 
-    active_df['court_name']
-    .value_counts()
-    .reset_index()
-
-)
-
-case_counts.columns = [
-
-    'court_name',
-
-    'total_cases'
-
-]
-
-court_stats = court_stats.merge(
-
-    case_counts,
-
-    on='court_name'
+    court_stats[
+        "high_risk_rate"
+    ] * 100
 
 )
 
-# =====================================================
-# KEEP COURTS WITH AT LEAST 1 CASE
-# =====================================================
 
-court_stats = court_stats[
-    court_stats['total_cases'] >= 1
-]
+court_stats[
+    "average_predicted_duration"
+] = (
 
-# =====================================================
-# DELAY BURDEN SCORE
-# =====================================================
-
-court_stats['delay_burden_score'] = (
-
-    court_stats['case_age_days'] * 0.5 +
-
-    court_stats['hearing_gap_days'] * 0.3 +
-
-    court_stats['priority_score'] * 0.2
+    court_stats[
+        "average_predicted_duration"
+    ]
 
 )
 
-# =====================================================
-# SORTING
-# =====================================================
 
-worst_courts = court_stats.sort_values(
+court_stats[
+    "average_case_age"
+] = (
 
-    by='delay_burden_score',
-
-    ascending=False
-
-)
-
-best_courts = court_stats.sort_values(
-
-    by='delay_burden_score',
-
-    ascending=True
+    court_stats[
+        "average_case_age"
+    ]
 
 )
 
-# =====================================================
-# KPI SECTION
-# =====================================================
 
-st.subheader('📊 Court Analytics')
+court_stats[
+    "average_hearing_gap"
+] = (
 
-col1, col2, col3 = st.columns(3)
+    court_stats[
+        "average_hearing_gap"
+    ]
 
-with col1:
+)
+
+
+# ============================================================
+# RANKINGS
+# ============================================================
+
+highest_risk = (
+
+    court_stats
+    .sort_values(
+        "average_high_risk_probability",
+        ascending=False
+    )
+)
+
+
+longest_duration = (
+
+    court_stats
+    .sort_values(
+        "average_predicted_duration",
+        ascending=False
+    )
+)
+
+
+best_performance = (
+
+    court_stats
+    .sort_values(
+        "performance_index",
+        ascending=False
+    )
+)
+
+
+# ============================================================
+# KPI
+# ============================================================
+
+st.subheader(
+    "📊 Court Performance Overview"
+)
+
+
+c1, c2, c3, c4 = st.columns(4)
+
+
+with c1:
 
     st.metric(
-        'Active Courts',
+        "Active Courts",
         len(court_stats)
     )
 
-with col2:
+
+with c2:
 
     st.metric(
-        'Average Court Delay',
-        f"{round(court_stats['case_age_days'].mean())} Days"
+        "Active Cases",
+        len(active_df)
     )
 
-with col3:
+
+with c3:
 
     st.metric(
-        'Average Hearing Gap',
-        f"{round(court_stats['hearing_gap_days'].mean())} Days"
+        "Avg Predicted Duration",
+        f"{active_df['predicted_duration_years'].mean():.2f} yrs"
     )
 
-# =====================================================
-# HIGHEST DELAY COURTS
-# =====================================================
 
-st.subheader('⚠ Courts with Highest Delay Burden')
+with c4:
 
-fig1 = px.bar(
+    st.metric(
+        "Avg High-Risk Probability",
+        f"{active_df['high_risk_probability'].mean() * 100:.1f}%"
+    )
 
-    worst_courts.head(10),
 
-    x='court_name',
+# ============================================================
+# COURT PERFORMANCE COMPARISON
+# ============================================================
 
-    y='delay_burden_score',
-
-    color='delay_burden_score',
-
-    text='delay_burden_score'
-
+st.subheader(
+    "📈 Court Performance Comparison"
 )
 
+st.caption(
+    "Higher performance index indicates a lower predicted "
+    "delay-risk and duration profile."
+)
+
+
+performance_chart = (
+
+    court_stats
+    .sort_values(
+        "performance_index",
+        ascending=False
+    )
+    .head(15)
+)
+
+
+fig = px.bar(
+
+    performance_chart,
+
+    x="court_name",
+
+    y="performance_index",
+
+    text="performance_index",
+
+    title="Court Performance Index"
+)
+
+
+fig.update_traces(
+    texttemplate="%{text:.1f}",
+    textposition="outside"
+)
+
+
+fig.update_yaxes(
+    title="Performance Index"
+)
+
+
+fig.update_xaxes(
+    title="Court"
+)
+
+
 st.plotly_chart(
-    fig1,
+    fig,
     use_container_width=True
 )
 
-# =====================================================
-# BEST COURTS
-# =====================================================
 
-st.subheader('✅ Courts with Lowest Delay Burden')
+# ============================================================
+# HIGH-RISK COURTS
+# ============================================================
 
-fig2 = px.bar(
-
-    best_courts.head(10),
-
-    x='court_name',
-
-    y='delay_burden_score',
-
-    color='delay_burden_score',
-
-    text='delay_burden_score'
-
+st.subheader(
+    "🚨 Courts with Highest Predicted Delay Risk"
 )
 
+
+risk_chart = (
+
+    highest_risk
+    .head(10)
+)
+
+
+fig = px.bar(
+
+    risk_chart,
+
+    x="court_name",
+
+    y="average_high_risk_probability",
+
+    text="average_high_risk_probability",
+
+    title="Average High-Risk Probability by Court"
+)
+
+
+fig.update_traces(
+    texttemplate="%{text:.1f}%",
+    textposition="outside"
+)
+
+
+fig.update_yaxes(
+    title="High-Risk Probability (%)"
+)
+
+
+fig.update_xaxes(
+    title="Court"
+)
+
+
 st.plotly_chart(
-    fig2,
+    fig,
     use_container_width=True
 )
 
-# =====================================================
+
+# ============================================================
+# PREDICTED DURATION
+# ============================================================
+
+st.subheader(
+    "📅 Courts with Longest Predicted Case Duration"
+)
+
+
+duration_chart = (
+
+    longest_duration
+    .head(10)
+)
+
+
+fig = px.bar(
+
+    duration_chart,
+
+    x="court_name",
+
+    y="average_predicted_duration",
+
+    text="average_predicted_duration",
+
+    title="Average Predicted Case Duration by Court"
+)
+
+
+fig.update_traces(
+    texttemplate="%{text:.2f} yrs",
+    textposition="outside"
+)
+
+
+fig.update_yaxes(
+    title="Predicted Duration (years)"
+)
+
+
+fig.update_xaxes(
+    title="Court"
+)
+
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+
+# ============================================================
+# CASE STAGE ANALYSIS
+# ============================================================
+
+st.subheader(
+    "⚠️ Predicted Delay Risk by Case Stage"
+)
+
+
+stage_stats = (
+
+    active_df
+
+    .groupby("stage_of_case")
+
+    .agg(
+
+        cases=(
+            "case_id",
+            "count"
+        ),
+
+        high_risk_probability=(
+            "high_risk_probability",
+            "mean"
+        ),
+
+        predicted_duration=(
+            "predicted_duration_years",
+            "mean"
+        )
+    )
+
+    .reset_index()
+)
+
+
+stage_stats[
+    "high_risk_probability"
+] *= 100
+
+
+fig = px.bar(
+
+    stage_stats.sort_values(
+        "high_risk_probability",
+        ascending=False
+    ),
+
+    x="stage_of_case",
+
+    y="high_risk_probability",
+
+    text="high_risk_probability",
+
+    title="Average High-Risk Probability by Case Stage"
+)
+
+
+fig.update_traces(
+    texttemplate="%{text:.1f}%",
+    textposition="outside"
+)
+
+
+fig.update_yaxes(
+    title="High-Risk Probability (%)"
+)
+
+
+fig.update_xaxes(
+    title="Case Stage"
+)
+
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+
+# ============================================================
+# DISTRICT SUMMARY
+# ============================================================
+
+st.subheader(
+    "🏛️ District-Level Court Performance"
+)
+
+
+district_stats = (
+
+    active_df
+
+    .groupby("district_name")
+
+    .agg(
+
+        cases=(
+            "case_id",
+            "count"
+        ),
+
+        high_risk_cases=(
+            "predicted_risk",
+            lambda x:
+            (x == "High").sum()
+        ),
+
+        average_high_risk_probability=(
+            "high_risk_probability",
+            "mean"
+        ),
+
+        average_predicted_duration=(
+            "predicted_duration_years",
+            "mean"
+        )
+
+    )
+
+    .reset_index()
+)
+
+
+district_stats[
+    "average_high_risk_probability"
+] = (
+
+    district_stats[
+        "average_high_risk_probability"
+    ] * 100
+
+).round(1)
+
+
+district_stats[
+    "average_predicted_duration"
+] = (
+
+    district_stats[
+        "average_predicted_duration"
+    ]
+
+).round(2)
+
+
+st.dataframe(
+
+    district_stats,
+
+    use_container_width=True,
+
+    hide_index=True
+)
+
+
+# ============================================================
 # COURT PERFORMANCE TABLE
-# =====================================================
+# ============================================================
 
-st.subheader('📋 Court Performance Table')
+st.subheader(
+    "📋 Court Performance Details"
+)
 
-display_table = court_stats[[
 
-    'court_name',
+display_table = court_stats[
+    [
+        "court_name",
+        "total_cases",
+        "high_risk_cases",
+        "average_high_risk_probability",
+        "high_risk_rate",
+        "average_predicted_duration",
+        "average_case_age",
+        "average_hearing_gap",
+        "performance_index"
+    ]
+].copy()
 
-    'total_cases',
-
-    'case_age_days',
-
-    'hearing_gap_days',
-
-    'priority_score',
-
-    'delay_burden_score'
-
-]]
 
 display_table.columns = [
 
-    'Court',
+    "Court",
 
-    'Total Cases',
+    "Active Cases",
 
-    'Average Delay',
+    "High-Risk Cases",
 
-    'Average Hearing Gap',
+    "Avg High-Risk Probability",
 
-    'Priority Score',
+    "High-Risk Rate",
 
-    'Delay Burden Score'
+    "Avg Predicted Duration",
 
+    "Avg Case Age",
+
+    "Avg Hearing Gap",
+
+    "Performance Index"
 ]
 
-st.dataframe(display_table)
 
-# =====================================================
-# BOTTLENECK COURTS
-# =====================================================
+display_table[
+    "Avg High-Risk Probability"
+] = display_table[
+    "Avg High-Risk Probability"
+].round(1)
 
-st.subheader('🚧 Court Bottleneck Detection')
 
-top_bottlenecks = worst_courts.head(5)
+display_table[
+    "High-Risk Rate"
+] = display_table[
+    "High-Risk Rate"
+].round(1)
 
-for index, row in top_bottlenecks.iterrows():
 
-    st.error(
+display_table[
+    "Avg Predicted Duration"
+] = display_table[
+    "Avg Predicted Duration"
+].round(2)
+
+
+display_table[
+    "Avg Case Age"
+] = display_table[
+    "Avg Case Age"
+].round(0)
+
+
+display_table[
+    "Avg Hearing Gap"
+] = display_table[
+    "Avg Hearing Gap"
+].round(0)
+
+
+display_table[
+    "Performance Index"
+] = display_table[
+    "Performance Index"
+].round(1)
+
+
+st.dataframe(
+
+    display_table,
+
+    use_container_width=True,
+
+    hide_index=True
+)
+
+
+# ============================================================
+# KEY FINDING
+# ============================================================
+
+st.subheader(
+    "📌 Key Performance Finding"
+)
+
+
+worst = highest_risk.iloc[0]
+
+best = best_performance.iloc[0]
+
+
+col1, col2 = st.columns(2)
+
+
+with col1:
+
+    st.warning(
 
         f"""
-        Court:
-        {row['court_name']}
+**Highest predicted delay-risk court**
 
-        Average Delay:
-        {round(row['case_age_days'])} days
+**{worst['court_name']}**
 
-        Average Hearing Gap:
-        {round(row['hearing_gap_days'])} days
+Average high-risk probability:
+**{worst['average_high_risk_probability']:.1f}%**
 
-        Delay Burden Score:
-        {round(row['delay_burden_score'])}
-
-        Cases:
-        {row['total_cases']}
-        """
-
+Average predicted duration:
+**{worst['average_predicted_duration']:.2f} years**
+"""
     )
 
-# =====================================================
-# BEST COURTS
-# =====================================================
 
-st.subheader('🏆 Best Performing Courts')
-
-top_best = best_courts.head(5)
-
-for index, row in top_best.iterrows():
+with col2:
 
     st.success(
 
         f"""
-        Court:
-        {row['court_name']}
+**Strongest predicted performance profile**
 
-        Average Delay:
-        {round(row['case_age_days'])} days
+**{best['court_name']}**
 
-        Average Hearing Gap:
-        {round(row['hearing_gap_days'])} days
+Performance index:
+**{best['performance_index']:.1f}**
 
-        Delay Burden Score:
-        {round(row['delay_burden_score'])}
-        """
+Average high-risk probability:
+**{best['average_high_risk_probability']:.1f}%**
 
+Average predicted duration:
+**{best['average_predicted_duration']:.2f} years**
+"""
     )
 
-# =====================================================
-# KEY INSIGHTS
-# =====================================================
 
-st.subheader('📌 Key Insights')
+# ============================================================
+# FOOTER
+# ============================================================
 
-worst = worst_courts.iloc[0]
+st.divider()
 
-best = best_courts.iloc[0]
-
-st.error(
-
-    f"""
-    {worst['court_name']} currently shows
-    the highest active judicial delay burden.
-
-    Delay Burden Score:
-    {round(worst['delay_burden_score'])}
-    """
-
-)
-
-st.success(
-
-    f"""
-    {best['court_name']} currently appears
-    to have the lowest judicial delay burden.
-
-    Delay Burden Score:
-    {round(best['delay_burden_score'])}
-    """
-
+st.caption(
+    "The Performance Index is an analytical comparison based "
+    "on predicted delay risk and predicted case duration. "
+    "It does not represent judicial quality, legal performance, "
+    "or a judicial decision."
 )

@@ -1,804 +1,1624 @@
 import streamlit as st
 import pandas as pd
 import re
-from datetime import datetime
-from preprocessing import preprocess_data
+import requests
 
-# OCR IMPORTS
+from datetime import datetime
+
 import pytesseract
 from pdf2image import convert_from_bytes
 
-# =====================================================
-# TESSERACT PATH
-# =====================================================
+from database.repository import (
+    get_cases,
+    add_case
+)
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Case Registration & ML Prediction",
+    page_icon="📥",
+    layout="wide"
+)
+
+
+# ============================================================
+# ML BACKEND
+# ============================================================
+
+ML_API_URL = "http://127.0.0.1:8000/predict"
+
+
+def get_ml_prediction(case_data):
+
+    try:
+
+        response = requests.post(
+            ML_API_URL,
+            json=case_data,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.ConnectionError:
+
+        st.error(
+            "ML backend is not running.\n\n"
+            "Start it using:\n"
+            "uvicorn backend.main:app --reload --port 8000"
+        )
+
+        return None
+
+    except requests.exceptions.RequestException as exc:
+
+        st.error(
+            f"ML prediction error: {exc}"
+        )
+
+        return None
+
+
+# ============================================================
+# OCR CONFIGURATION
+# ============================================================
 
 pytesseract.pytesseract.tesseract_cmd = (
-    r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
-
-# =====================================================
-# POPPLER PATH
-# =====================================================
 
 POPPLER_PATH = (
-    r'C:\poppler\poppler-24.08.0\Library\bin'
+    r"C:\poppler\poppler-24.08.0\Library\bin"
 )
 
-# =====================================================
-# LOAD DATA
-# =====================================================
 
-df = preprocess_data('cleaned_cases.csv')
+# ============================================================
+# LOAD POSTGRESQL DATA
+# ============================================================
 
-# =====================================================
-# PAGE TITLE
-# =====================================================
+@st.cache_data(ttl=30)
+def load_cases():
 
-st.title('📥 Dynamic Case Input & OCR Extraction')
+    return get_cases()
+
+
+try:
+
+    df = load_cases()
+
+except Exception as exc:
+
+    st.error(
+        "Unable to connect to PostgreSQL."
+    )
+
+    st.exception(exc)
+
+    st.stop()
+
+
+if df.empty:
+
+    st.warning(
+        "No cases found in PostgreSQL."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_districts():
+
+    if "district_name" not in df.columns:
+
+        return []
+
+    return sorted(
+        df["district_name"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+
+def get_stages():
+
+    if "stage_of_case" not in df.columns:
+
+        return []
+
+    return sorted(
+        df["stage_of_case"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+
+def get_workload(district):
+
+    if "district_workload_level" not in df.columns:
+
+        return "Medium"
+
+    rows = df[
+        df["district_name"]
+        .astype(str)
+        .str.lower()
+        ==
+        str(district).lower()
+    ]
+
+    if rows.empty:
+
+        return "Medium"
+
+    values = (
+        rows[
+            "district_workload_level"
+        ]
+        .dropna()
+        .astype(str)
+    )
+
+    if values.empty:
+
+        return "Medium"
+
+    return str(
+        values.mode().iloc[0]
+    )
+
+
+# ============================================================
+# DISPLAY ML RESULT
+# ============================================================
+
+def display_ml_result(result):
+
+    if not result:
+
+        return
+
+    st.divider()
+
+    st.subheader(
+        "🤖 XGBoost Prediction"
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        duration = float(
+            result.get(
+                "predicted_duration_years",
+                0
+            )
+        )
+
+        st.metric(
+            "Predicted Duration",
+            f"{duration:.2f} years"
+        )
+
+    with col2:
+
+        predicted_risk = result.get(
+            "predicted_risk",
+            "Unknown"
+        )
+
+        st.metric(
+            "Predicted Delay Risk",
+            predicted_risk
+        )
+
+    with col3:
+
+        probabilities = result.get(
+            "risk_probabilities",
+            {}
+        )
+
+        high_probability = float(
+            probabilities.get(
+                "High",
+                0
+            )
+        )
+
+        st.metric(
+            "High-Risk Probability",
+            f"{high_probability * 100:.1f}%"
+        )
+
+    # ========================================================
+    # RISK PROBABILITIES
+    # ========================================================
+
+    st.subheader(
+        "📊 Risk Probabilities"
+    )
+
+    if probabilities:
+
+        for category, probability in probabilities.items():
+
+            probability = float(
+                probability
+            )
+
+            st.write(
+                f"**{category}:** "
+                f"{probability * 100:.2f}%"
+            )
+
+            st.progress(
+                min(
+                    max(
+                        probability,
+                        0.0
+                    ),
+                    1.0
+                )
+            )
+
+    # ========================================================
+    # SHAP EXPLANATION
+    # ========================================================
+
+    explanation = result.get(
+        "explanation",
+        []
+    )
+
+    if explanation:
+
+        st.subheader(
+            "🔍 SHAP Explanation"
+        )
+
+        explanation_df = pd.DataFrame(
+            explanation
+        )
+
+        if "shap_value" in explanation_df.columns:
+
+            explanation_df[
+                "shap_value"
+            ] = pd.to_numeric(
+                explanation_df[
+                    "shap_value"
+                ],
+                errors="coerce"
+            ).round(4)
+
+        st.dataframe(
+            explanation_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "SHAP values show which model features "
+            "contributed most to the prediction."
+        )
+
+    else:
+
+        st.info(
+            "No SHAP explanation was returned."
+        )
+
+
+# ============================================================
+# TITLE
+# ============================================================
+
+st.title(
+    "📥 Case Registration & ML Prediction"
+)
 
 st.markdown(
-    '### Upload eCourts PDFs or Manually Add Cases'
+    "### Enter a new case or extract case details "
+    "from an eCourts PDF."
 )
 
-# =====================================================
+st.caption(
+    "Cases are stored in PostgreSQL and evaluated using "
+    "XGBoost-based risk and duration predictions."
+)
+
+
+# ============================================================
 # INPUT METHOD
-# =====================================================
+# ============================================================
 
 input_method = st.radio(
-
-    'Choose Input Method',
-
-    ['Manual Entry', 'PDF Upload']
-
+    "Choose Input Method",
+    [
+        "Manual Entry",
+        "PDF Upload"
+    ],
+    horizontal=True
 )
 
-# =====================================================
+
+# ============================================================
 # MANUAL ENTRY
-# =====================================================
+# ============================================================
 
-if input_method == 'Manual Entry':
+if input_method == "Manual Entry":
 
-    st.subheader('✍ Manual Case Entry')
-
-    district = st.selectbox(
-
-        'District',
-
-        sorted(df['district_name'].unique())
-
+    st.subheader(
+        "✍️ Manual Case Entry"
     )
 
-    court_name = st.text_input(
-        'Court Name'
-    )
+    # ========================================================
+    # BASIC INFORMATION
+    # ========================================================
 
-    stage = st.selectbox(
+    col1, col2 = st.columns(2)
 
-        'Stage of Case',
+    with col1:
 
-        sorted(df['stage_of_case'].unique())
+        districts = get_districts()
 
-    )
+        if districts:
 
-    case_status = st.selectbox(
-
-        'Case Status',
-
-        ['Pending', 'Disposed']
-
-    )
-
-    case_age = st.number_input(
-
-        'Case Age (Days)',
-
-        min_value=0,
-
-        value=100
-
-    )
-
-    hearing_gap = st.number_input(
-
-        'Hearing Gap (Days)',
-
-        min_value=0,
-
-        value=30
-
-    )
-
-    # =================================================
-    # ADD MANUAL CASE
-    # =================================================
-
-    if st.button('Add Case'):
-
-        # Risk
-        if case_age > 1200:
-
-            risk = 'High'
-
-        elif case_age > 600:
-
-            risk = 'Medium'
+            district = st.selectbox(
+                "District",
+                districts
+            )
 
         else:
 
-            risk = 'Low'
+            district = st.text_input(
+                "District"
+            )
 
-        # Priority
-        priority_score = (
+    with col2:
 
-            case_age * 0.6 +
-
-            hearing_gap * 0.4
-
+        court_name = st.text_input(
+            "Court Name"
         )
 
-        # Explanation
-        explanations = []
+    col1, col2 = st.columns(2)
 
-        if case_age > 900:
+    with col1:
 
-            explanations.append(
-                'Extremely long pending case'
+        stages = get_stages()
+
+        if stages:
+
+            stage = st.selectbox(
+                "Stage of Case",
+                stages
             )
 
-        elif case_age > 500:
+        else:
 
-            explanations.append(
-                'Long pending case'
+            stage = st.text_input(
+                "Stage of Case"
             )
 
-        if hearing_gap > 120:
+    with col2:
 
-            explanations.append(
-                'Excessive hearing gaps'
-            )
-
-        elif hearing_gap > 60:
-
-            explanations.append(
-                'Large hearing intervals'
-            )
-
-        delay_explanation = (
-            ', '.join(explanations)
+        case_status = st.selectbox(
+            "Case Status",
+            [
+                "PENDING",
+                "DISPOSED"
+            ]
         )
 
-        # Recommendations
-        recommendations = []
+    # ========================================================
+    # CASE DETAILS
+    # ========================================================
 
-        if case_age > 1200:
+    st.subheader(
+        "📋 Case Details"
+    )
 
-            recommendations.append(
-                'Create special disposal bench'
-            )
+    col1, col2 = st.columns(2)
 
-        elif case_age > 700:
+    with col1:
 
-            recommendations.append(
-                'Schedule continuous hearings'
-            )
-
-        elif case_age > 500:
-
-            recommendations.append(
-                'Monitor under long-pending category'
-            )
-
-        if hearing_gap > 120:
-
-            recommendations.append(
-                'Reduce excessive adjournments'
-            )
-
-        elif hearing_gap > 60:
-
-            recommendations.append(
-                'Increase hearing frequency'
-            )
-
-        if stage.lower() == 'evidence':
-
-            recommendations.append(
-                'Accelerate evidence recording'
-            )
-
-        elif stage.lower() == 'hearing':
-
-            recommendations.append(
-                'Prioritize hearing-stage clearance'
-            )
-
-        elif 'summons' in stage.lower():
-
-            recommendations.append(
-                'Investigate summons execution delays'
-            )
-
-        recommendation_text = (
-
-            ' | '.join(set(recommendations))
-
+        cnr_number = st.text_input(
+            "CNR Number"
         )
 
-        # Create row
-        new_case = pd.DataFrame({
-
-            'district_name': [district],
-
-            'court_name': [court_name],
-
-            'stage_of_case': [stage],
-
-            'case_age_days': [case_age],
-
-            'hearing_gap_days': [hearing_gap],
-
-            'calculated_risk': [risk],
-
-            'priority_score': [priority_score],
-
-            'delay_explanation': [delay_explanation],
-
-            'recommendation': [recommendation_text],
-
-            'case_status': [case_status]
-
-        })
-
-        # =================================================
-        # RELOAD LATEST CSV
-        # =================================================
-
-        latest_df = preprocess_data(
-            'cleaned_cases.csv'
+        registration_number = st.text_input(
+            "Registration Number"
         )
 
-        updated_df = pd.concat(
-
-            [latest_df, new_case],
-
-            ignore_index=True
-
+        case_type = st.text_input(
+            "Case Type",
+            value="Criminal"
         )
 
-        updated_df.to_csv(
-
-            'cleaned_cases.csv',
-
-            index=False
-
+        act_name = st.text_input(
+            "Act Name",
+            value="IPC"
         )
 
-        st.success(
-            'Case added successfully.'
+    with col2:
+
+        section = st.text_input(
+            "Section",
+            value="Unknown"
         )
 
-# =====================================================
+        police_station = st.text_input(
+            "Police Station",
+            value="Unknown"
+        )
+
+        source_type = st.selectbox(
+            "Source Type",
+            [
+                "MANUAL"
+            ]
+        )
+
+    # ========================================================
+    # DATES
+    # ========================================================
+
+    st.subheader(
+        "📅 Case Dates"
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        filing_date = st.date_input(
+            "Filing Date"
+        )
+
+    with col2:
+
+        first_hearing_date = st.date_input(
+            "First Hearing Date"
+        )
+
+    with col3:
+
+        decision_date = st.date_input(
+            "Decision Date",
+            value=None
+        )
+
+    # ========================================================
+    # CALCULATED FEATURES
+    # ========================================================
+
+    filing_datetime = datetime.combine(
+        filing_date,
+        datetime.min.time()
+    )
+
+    today = datetime.today()
+
+    case_age_days = max(
+        0,
+        (
+            today
+            -
+            filing_datetime
+        ).days
+    )
+
+    first_hearing_datetime = datetime.combine(
+        first_hearing_date,
+        datetime.min.time()
+    )
+
+    hearing_gap_days = max(
+        0,
+        (
+            today
+            -
+            first_hearing_datetime
+        ).days
+    )
+
+    first_hearing_delay_days = max(
+        0,
+        (
+            first_hearing_datetime
+            -
+            filing_datetime
+        ).days
+    )
+
+    filing_year = filing_date.year
+
+    filing_month = filing_date.month
+
+    st.subheader(
+        "🧮 Calculated ML Features"
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+
+        st.metric(
+            "Case Age",
+            f"{case_age_days} days"
+        )
+
+    with c2:
+
+        st.metric(
+            "First Hearing Delay",
+            f"{first_hearing_delay_days} days"
+        )
+
+    with c3:
+
+        st.metric(
+            "Hearing Gap",
+            f"{hearing_gap_days} days"
+        )
+
+    # ========================================================
+    # ADD CASE
+    # ========================================================
+
+    if st.button(
+        "➕ Add Case",
+        type="primary",
+        use_container_width=True
+    ):
+
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
+
+        errors = []
+
+        if not district.strip():
+
+            errors.append(
+                "District is required."
+            )
+
+        if not court_name.strip():
+
+            errors.append(
+                "Court Name is required."
+            )
+
+        if not stage.strip():
+
+            errors.append(
+                "Stage of Case is required."
+            )
+
+        if not cnr_number.strip():
+
+            errors.append(
+                "CNR Number is required."
+            )
+
+        if errors:
+
+            for error in errors:
+
+                st.error(
+                    error
+                )
+
+            st.stop()
+
+        # ====================================================
+        # ML INPUT
+        # ====================================================
+
+        ml_case = {
+
+            "district_name":
+                district,
+
+            "district_workload_level":
+                get_workload(
+                    district
+                ),
+
+            "court_name":
+                court_name,
+
+            "case_type":
+                case_type,
+
+            "stage_of_case":
+                stage,
+
+            "act_name":
+                act_name,
+
+            "section":
+                section,
+
+            "police_station":
+                police_station,
+
+            "case_age_days":
+                case_age_days,
+
+            "hearing_gap_days":
+                hearing_gap_days,
+
+            "filing_year":
+                filing_year,
+
+            "filing_month":
+                filing_month,
+
+            "filing_month_feature":
+                filing_month,
+
+            "first_hearing_delay_days":
+                first_hearing_delay_days
+        }
+
+        # ====================================================
+        # ML PREDICTION
+        # ====================================================
+
+        with st.spinner(
+            "Running XGBoost prediction..."
+        ):
+
+            ml_result = get_ml_prediction(
+                ml_case
+            )
+
+        display_ml_result(
+            ml_result
+        )
+
+        # ====================================================
+        # PREPARE DATABASE RECORD
+        # ====================================================
+
+        case_data = {
+
+            "cnr_number":
+                cnr_number.strip(),
+
+            "registration_number":
+                registration_number.strip(),
+
+            "district_name":
+                district.strip(),
+
+            "court_name":
+                court_name.strip(),
+
+            "stage_of_case":
+                stage.strip(),
+
+            "case_type":
+                case_type.strip(),
+
+            "act_name":
+                act_name.strip(),
+
+            "section":
+                section.strip(),
+
+            "police_station":
+                police_station.strip(),
+
+            "filing_date":
+                filing_date,
+
+            "first_hearing_date":
+                first_hearing_date,
+
+            "decision_date":
+                decision_date,
+
+            "case_status":
+                case_status,
+
+            "disposal_type":
+                None,
+
+            "source_type":
+                source_type
+        }
+
+        # ====================================================
+        # INSERT INTO POSTGRESQL
+        # ====================================================
+
+        try:
+
+            new_case_id = add_case(
+                case_data
+            )
+
+            st.success(
+                "✅ Case added successfully to PostgreSQL."
+            )
+
+            st.info(
+                f"Case ID: {new_case_id}"
+            )
+
+            # ------------------------------------------------
+            # SHOW ML RESULT AGAIN
+            # ------------------------------------------------
+
+            if ml_result:
+
+                st.subheader(
+                    "🤖 Saved Case ML Result"
+                )
+
+                predicted_risk = ml_result.get(
+                    "predicted_risk",
+                    "Unknown"
+                )
+
+                predicted_duration = float(
+                    ml_result.get(
+                        "predicted_duration_years",
+                        0
+                    )
+                )
+
+                probabilities = ml_result.get(
+                    "risk_probabilities",
+                    {}
+                )
+
+                high_probability = float(
+                    probabilities.get(
+                        "High",
+                        0
+                    )
+                )
+
+                c1, c2, c3 = st.columns(3)
+
+                with c1:
+
+                    st.metric(
+                        "ML Risk",
+                        predicted_risk
+                    )
+
+                with c2:
+
+                    st.metric(
+                        "Predicted Duration",
+                        f"{predicted_duration:.2f} years"
+                    )
+
+                with c3:
+
+                    st.metric(
+                        "High-Risk Probability",
+                        f"{high_probability * 100:.1f}%"
+                    )
+
+            # ------------------------------------------------
+            # REFRESH
+            # ------------------------------------------------
+
+            st.cache_data.clear()
+
+        except Exception as exc:
+
+            st.error(
+                "Unable to save the case to PostgreSQL."
+            )
+
+            st.exception(exc)
+
+
+# ============================================================
 # PDF UPLOAD
-# =====================================================
+# ============================================================
 
-elif input_method == 'PDF Upload':
+else:
 
-    st.subheader('📄 Upload eCourts PDF')
+    st.subheader(
+        "📄 Upload eCourts PDF"
+    )
 
     uploaded_pdf = st.file_uploader(
-
-        'Upload PDF',
-
-        type='pdf'
-
+        "Upload PDF",
+        type=["pdf"]
     )
 
     if uploaded_pdf:
 
-        text = ''
+        # ====================================================
+        # OCR
+        # ====================================================
 
-        # =================================================
-        # OCR EXTRACTION
-        # =================================================
+        text = ""
 
         try:
 
+            pdf_bytes = uploaded_pdf.read()
+
             images = convert_from_bytes(
-
-                uploaded_pdf.read(),
-
+                pdf_bytes,
                 poppler_path=POPPLER_PATH
-
             )
 
-            for img in images:
+            progress = st.progress(
+                0
+            )
 
-                extracted = pytesseract.image_to_string(img)
+            total = len(images)
 
-                text += extracted + '\n'
+            for index, image in enumerate(images):
 
-        except Exception as e:
+                extracted = (
+                    pytesseract.image_to_string(
+                        image
+                    )
+                )
 
-            st.error(f'OCR Error: {e}')
+                text += (
+                    extracted
+                    +
+                    "\n"
+                )
 
-        # =================================================
-        # SHOW OCR TEXT
-        # =================================================
+                progress.progress(
+                    (index + 1) / total
+                )
 
-        st.subheader('📑 Extracted OCR Text')
+            progress.empty()
 
-        st.text_area(
+        except Exception as exc:
 
-            'OCR Output',
+            st.error(
+                f"OCR Error: {exc}"
+            )
 
-            text,
+            st.stop()
 
-            height=300
+        # ====================================================
+        # OCR TEXT
+        # ====================================================
 
+        st.subheader(
+            "📑 Extracted OCR Text"
         )
 
-        # =================================================
-        # DISTRICT DETECTION
-        # =================================================
+        st.text_area(
+            "OCR Output",
+            text,
+            height=300
+        )
 
-        district = 'Unknown'
+        if not text.strip():
+
+            st.warning(
+                "No text could be extracted from the PDF."
+            )
+
+            st.stop()
+
+        lower_text = text.lower()
+
+        # ====================================================
+        # DISTRICT
+        # ====================================================
+
+        district = "Unknown"
 
         district_map = {
 
-            'mysuru': 'Mysuru',
+            "mysuru":
+                "Mysuru",
 
-            'bengaluru': 'Bengaluru Urban',
+            "mysore":
+                "Mysuru",
 
-            'tumakuru': 'Tumakuru',
+            "bengaluru":
+                "Bengaluru Urban",
 
-            'belagavi': 'Belagavi',
+            "bangalore":
+                "Bengaluru Urban",
 
-            'kalaburagi': 'Kalaburagi'
+            "tumakuru":
+                "Tumakuru",
 
+            "tumkur":
+                "Tumakuru",
+
+            "belagavi":
+                "Belagavi",
+
+            "kalaburagi":
+                "Kalaburagi"
         }
 
         for key, value in district_map.items():
 
-            if key in text.lower():
+            if key in lower_text:
 
                 district = value
 
-        # =================================================
-        # COURT NAME
-        # =================================================
+                break
 
-        court_name = ''
+        # ====================================================
+        # COURT
+        # ====================================================
+
+        court_name = ""
 
         court_patterns = [
 
-            r'PRL.*?NANJANGUD',
+            r"PRL\.?\s*.*?COURT",
 
-            r'COURT.*?MYSURU',
+            r"COURT\s+OF\s+.*",
 
-            r'JUDGE.*?MYSURU'
+            r"COURT.*?MYSURU",
 
+            r"COURT.*?BENGALURU",
+
+            r"COURT.*?TUMAKURU"
         ]
 
         for pattern in court_patterns:
 
             match = re.search(
-
                 pattern,
-
                 text,
-
                 re.IGNORECASE
-
             )
 
             if match:
 
-                court_name = match.group(0)
+                court_name = (
+                    match.group(0)
+                    .strip()
+                )
 
                 break
 
-        # =================================================
-        # STAGE DETECTION
-        # =================================================
+        # ====================================================
+        # STAGE
+        # ====================================================
 
-        stage = 'Unknown'
+        stage = "Unknown"
 
         stage_keywords = [
 
-            'EVIDENCE',
+            "RE-ISSUE SUMMONS",
 
-            'HEARING',
+            "REISSUE SUMMONS",
 
-            'ARGUMENT',
+            "EVIDENCE",
 
-            'JUDGMENT',
+            "HEARING",
 
-            'SUMMONS',
+            "ARGUMENT",
 
-            'RE ISSUE SUMMONS',
+            "JUDGMENT",
 
-            'STEPS',
+            "SUMMONS",
 
-            'NBW'
+            "APPEARANCE",
 
+            "NBW",
+
+            "STEPS"
         ]
 
         for keyword in stage_keywords:
 
-            if keyword.lower() in text.lower():
+            if keyword.lower() in lower_text:
 
-                stage = keyword.title()
+                stage = keyword
 
                 break
 
-        # =================================================
-        # CASE STATUS
-        # =================================================
+        # ====================================================
+        # STATUS
+        # ====================================================
 
-        case_status = 'Pending'
+        case_status = "PENDING"
 
-        if 'disposed' in text.lower():
+        if (
+            "disposed" in lower_text
+            or
+            "case disposed" in lower_text
+            or
+            "closed" in lower_text
+        ):
 
-            case_status = 'Disposed'
+            case_status = "DISPOSED"
 
-        # =================================================
+        # ====================================================
+        # CNR
+        # ====================================================
+
+        cnr_number = ""
+
+        cnr_patterns = [
+
+            r"\b[A-Z]{4}\d{12}\b",
+
+            r"\b[A-Z]{4}\d{10,14}\b"
+        ]
+
+        for pattern in cnr_patterns:
+
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE
+            )
+
+            if match:
+
+                cnr_number = (
+                    match.group(0)
+                    .upper()
+                )
+
+                break
+
+        # ====================================================
         # REGISTRATION NUMBER
-        # =================================================
+        # ====================================================
 
-        registration_number = ''
+        registration_number = ""
 
         reg_patterns = [
 
-            r'\d{1,6}/\d{4}',
+            r"C\.C\.\s*No\.?\s*\d+\s*/\s*\d{4}",
 
-            r'C\.C\.\s*No\.\s*\d+/\d+'
-
+            r"\b\d{1,6}\s*/\s*\d{4}\b"
         ]
 
         for pattern in reg_patterns:
 
-            match = re.search(pattern, text)
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE
+            )
 
             if match:
 
-                registration_number = match.group(0)
+                registration_number = (
+                    match.group(0)
+                    .strip()
+                )
 
                 break
 
-        # =================================================
-        # FILING DATE
-        # =================================================
-
-        filing_date = ''
-
-        filing_match = re.search(
-
-            r'\d{2}-\d{2}-\d{4}',
-
-            text
-
-        )
-
-        if filing_match:
-
-            filing_date = filing_match.group(0)
-
-        # =================================================
-        # CASE AGE
-        # =================================================
-
-        case_age = 0
-
-        try:
-
-            if filing_date:
-
-                filing_dt = datetime.strptime(
-
-                    filing_date,
-
-                    '%d-%m-%Y'
-
-                )
-
-                case_age = (
-
-                    datetime.today() - filing_dt
-
-                ).days
-
-        except:
-            pass
-
-        # =================================================
-        # HEARING GAP
-        # =================================================
-
-        hearing_gap = 30
+        # ====================================================
+        # DATES
+        # ====================================================
 
         all_dates = re.findall(
-
-            r'\d{2}-\d{2}-\d{4}',
-
+            r"\b\d{2}[-/]\d{2}[-/]\d{4}\b",
             text
-
         )
 
-        try:
+        def parse_date_string(value):
 
-            if len(all_dates) >= 2:
+            value = value.replace(
+                "/",
+                "-"
+            )
 
-                d1 = datetime.strptime(
+            try:
 
-                    all_dates[-2],
+                return datetime.strptime(
+                    value,
+                    "%d-%m-%Y"
+                ).date()
 
-                    '%d-%m-%Y'
+            except ValueError:
 
+                return None
+
+        parsed_dates = []
+
+        for value in all_dates:
+
+            parsed = parse_date_string(
+                value
+            )
+
+            if parsed:
+
+                parsed_dates.append(
+                    parsed
                 )
 
-                d2 = datetime.strptime(
+        filing_date = (
 
-                    all_dates[-1],
+            parsed_dates[0]
 
-                    '%d-%m-%Y'
+            if parsed_dates
 
+            else datetime.today().date()
+
+        )
+
+        first_hearing_date = (
+
+            parsed_dates[1]
+
+            if len(parsed_dates) >= 2
+
+            else filing_date
+
+        )
+
+        decision_date = None
+
+        if case_status == "DISPOSED":
+
+            if len(parsed_dates) >= 3:
+
+                decision_date = (
+                    parsed_dates[-1]
                 )
 
-                hearing_gap = abs(
-                    (d2 - d1).days
+        # ====================================================
+        # CALCULATED FEATURES
+        # ====================================================
+
+        filing_datetime = datetime.combine(
+            filing_date,
+            datetime.min.time()
+        )
+
+        first_hearing_datetime = datetime.combine(
+            first_hearing_date,
+            datetime.min.time()
+        )
+
+        case_age_days = max(
+            0,
+            (
+                datetime.today()
+                -
+                filing_datetime
+            ).days
+        )
+
+        first_hearing_delay_days = max(
+            0,
+            (
+                first_hearing_datetime
+                -
+                filing_datetime
+            ).days
+        )
+
+        hearing_gap_days = max(
+            0,
+            (
+                datetime.today()
+                -
+                first_hearing_datetime
+            ).days
+        )
+
+        filing_year = (
+            filing_date.year
+        )
+
+        filing_month = (
+            filing_date.month
+        )
+
+        # ====================================================
+        # VERIFY INFORMATION
+        # ====================================================
+
+        st.subheader(
+            "✅ Verify Extracted Information"
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            district = st.text_input(
+                "District",
+                value=district
+            )
+
+            court_name = st.text_input(
+                "Court Name",
+                value=court_name
+            )
+
+            cnr_number = st.text_input(
+                "CNR Number",
+                value=cnr_number
+            )
+
+            registration_number = st.text_input(
+                "Registration Number",
+                value=registration_number
+            )
+
+            stage = st.text_input(
+                "Stage of Case",
+                value=stage
+            )
+
+        with col2:
+
+            case_status = st.selectbox(
+                "Case Status",
+                [
+                    "PENDING",
+                    "DISPOSED"
+                ],
+                index=(
+                    1
+                    if case_status == "DISPOSED"
+                    else 0
                 )
+            )
 
-        except:
-            pass
+            filing_date = st.date_input(
+                "Filing Date",
+                value=filing_date
+            )
 
-        # =================================================
-        # VERIFY DATA
-        # =================================================
+            first_hearing_date = st.date_input(
+                "First Hearing Date",
+                value=first_hearing_date
+            )
 
-        st.subheader('✅ Verify Extracted Information')
+            if decision_date:
 
-        district = st.text_input(
-            'District',
-            value=district
-        )
-
-        court_name = st.text_input(
-            'Court Name',
-            value=court_name
-        )
-
-        registration_number = st.text_input(
-            'Registration Number',
-            value=registration_number
-        )
-
-        stage = st.text_input(
-            'Stage of Case',
-            value=stage
-        )
-
-        case_status = st.text_input(
-            'Case Status',
-            value=case_status
-        )
-
-        filing_date = st.text_input(
-            'Filing Date',
-            value=filing_date
-        )
-
-        case_age = st.number_input(
-            'Case Age (Days)',
-            value=int(case_age)
-        )
-
-        hearing_gap = st.number_input(
-            'Hearing Gap (Days)',
-            value=int(hearing_gap)
-        )
-
-        # =================================================
-        # ADD EXTRACTED CASE
-        # =================================================
-
-        if st.button('Add Extracted Case'):
-
-            # Risk
-            if case_age > 1200:
-
-                risk = 'High'
-
-            elif case_age > 600:
-
-                risk = 'Medium'
+                decision_date = st.date_input(
+                    "Decision Date",
+                    value=decision_date
+                )
 
             else:
 
-                risk = 'Low'
+                decision_date = st.date_input(
+                    "Decision Date",
+                    value=None
+                )
 
-            # Priority
-            priority_score = (
+        # ====================================================
+        # ADDITIONAL ML INFORMATION
+        # ====================================================
 
-                case_age * 0.6 +
+        st.subheader(
+            "🧠 ML Information"
+        )
 
-                hearing_gap * 0.4
+        col1, col2 = st.columns(2)
 
+        with col1:
+
+            case_type = st.text_input(
+                "Case Type",
+                value="Criminal"
             )
 
-            # Explanation
-            explanations = []
-
-            if case_age > 900:
-
-                explanations.append(
-                    'Extremely long pending case'
-                )
-
-            elif case_age > 500:
-
-                explanations.append(
-                    'Long pending case'
-                )
-
-            if hearing_gap > 120:
-
-                explanations.append(
-                    'Excessive hearing gaps'
-                )
-
-            elif hearing_gap > 60:
-
-                explanations.append(
-                    'Large hearing intervals'
-                )
-
-            delay_explanation = (
-                ', '.join(explanations)
+            act_name = st.text_input(
+                "Act Name",
+                value="IPC"
             )
 
-            # Recommendations
-            recommendations = []
+        with col2:
 
-            if case_age > 1200:
-
-                recommendations.append(
-                    'Create special disposal bench'
-                )
-
-            elif case_age > 700:
-
-                recommendations.append(
-                    'Schedule continuous hearings'
-                )
-
-            elif case_age > 500:
-
-                recommendations.append(
-                    'Monitor under long-pending category'
-                )
-
-            if hearing_gap > 120:
-
-                recommendations.append(
-                    'Reduce excessive adjournments'
-                )
-
-            elif hearing_gap > 60:
-
-                recommendations.append(
-                    'Increase hearing frequency'
-                )
-
-            if stage.lower() == 'evidence':
-
-                recommendations.append(
-                    'Accelerate evidence recording'
-                )
-
-            elif stage.lower() == 'hearing':
-
-                recommendations.append(
-                    'Prioritize hearing-stage clearance'
-                )
-
-            elif 'summons' in stage.lower():
-
-                recommendations.append(
-                    'Investigate summons execution delays'
-                )
-
-            recommendation_text = (
-
-                ' | '.join(set(recommendations))
-
+            section = st.text_input(
+                "Section",
+                value="Unknown"
             )
 
-            # Create row
-            new_case = pd.DataFrame({
+            police_station = st.text_input(
+                "Police Station",
+                value="Unknown"
+            )
 
-                'district_name': [district],
+        # ====================================================
+        # RECALCULATE FEATURES
+        # ====================================================
 
-                'court_name': [court_name],
+        filing_datetime = datetime.combine(
+            filing_date,
+            datetime.min.time()
+        )
 
-                'stage_of_case': [stage],
+        first_hearing_datetime = datetime.combine(
+            first_hearing_date,
+            datetime.min.time()
+        )
 
-                'case_age_days': [case_age],
+        case_age_days = max(
+            0,
+            (
+                datetime.today()
+                -
+                filing_datetime
+            ).days
+        )
 
-                'hearing_gap_days': [hearing_gap],
+        first_hearing_delay_days = max(
+            0,
+            (
+                first_hearing_datetime
+                -
+                filing_datetime
+            ).days
+        )
 
-                'calculated_risk': [risk],
+        hearing_gap_days = max(
+            0,
+            (
+                datetime.today()
+                -
+                first_hearing_datetime
+            ).days
+        )
 
-                'priority_score': [priority_score],
+        filing_year = filing_date.year
 
-                'delay_explanation': [delay_explanation],
+        filing_month = filing_date.month
 
-                'recommendation': [recommendation_text],
+        # ====================================================
+        # SHOW FEATURES
+        # ====================================================
 
-                'case_status': [case_status]
+        c1, c2, c3 = st.columns(3)
 
-            })
+        with c1:
+
+            st.metric(
+                "Case Age",
+                f"{case_age_days} days"
+            )
+
+        with c2:
+
+            st.metric(
+                "First Hearing Delay",
+                f"{first_hearing_delay_days} days"
+            )
+
+        with c3:
+
+            st.metric(
+                "Hearing Gap",
+                f"{hearing_gap_days} days"
+            )
+
+        # ====================================================
+        # ADD EXTRACTED CASE
+        # ====================================================
+
+        if st.button(
+            "➕ Add Extracted Case",
+            type="primary",
+            use_container_width=True
+        ):
+
+            errors = []
+
+            if not district.strip():
+
+                errors.append(
+                    "District is required."
+                )
+
+            if not court_name.strip():
+
+                errors.append(
+                    "Court Name is required."
+                )
+
+            if not stage.strip():
+
+                errors.append(
+                    "Stage of Case is required."
+                )
+
+            if not cnr_number.strip():
+
+                errors.append(
+                    "CNR Number is required."
+                )
+
+            if errors:
+
+                for error in errors:
+
+                    st.error(
+                        error
+                    )
+
+                st.stop()
 
             # =================================================
-            # RELOAD LATEST CSV
+            # ML CASE
             # =================================================
 
-            latest_df = preprocess_data(
-                'cleaned_cases.csv'
+            ml_case = {
+
+                "district_name":
+                    district,
+
+                "district_workload_level":
+                    get_workload(
+                        district
+                    ),
+
+                "court_name":
+                    court_name,
+
+                "case_type":
+                    case_type,
+
+                "stage_of_case":
+                    stage,
+
+                "act_name":
+                    act_name,
+
+                "section":
+                    section,
+
+                "police_station":
+                    police_station,
+
+                "case_age_days":
+                    case_age_days,
+
+                "hearing_gap_days":
+                    hearing_gap_days,
+
+                "filing_year":
+                    filing_year,
+
+                "filing_month":
+                    filing_month,
+
+                "filing_month_feature":
+                    filing_month,
+
+                "first_hearing_delay_days":
+                    first_hearing_delay_days
+            }
+
+            # =================================================
+            # ML PREDICTION
+            # =================================================
+
+            with st.spinner(
+                "Running XGBoost prediction..."
+            ):
+
+                ml_result = get_ml_prediction(
+                    ml_case
+                )
+
+            display_ml_result(
+                ml_result
             )
 
-            updated_df = pd.concat(
+            # =================================================
+            # DATABASE RECORD
+            # =================================================
 
-                [latest_df, new_case],
+            case_data = {
 
-                ignore_index=True
+                "cnr_number":
+                    cnr_number.strip(),
 
-            )
+                "registration_number":
+                    registration_number.strip(),
 
-            updated_df.to_csv(
+                "district_name":
+                    district.strip(),
 
-                'cleaned_cases.csv',
+                "court_name":
+                    court_name.strip(),
 
-                index=False
+                "stage_of_case":
+                    stage.strip(),
 
-            )
+                "case_type":
+                    case_type.strip(),
 
-            st.success(
-                'PDF case extracted successfully.'
-            )
+                "act_name":
+                    act_name.strip(),
 
-            st.info(
-                f'Recommendation: {recommendation_text}'
-            )
+                "section":
+                    section.strip(),
 
-# =====================================================
-# DELETE CASES
-# =====================================================
+                "police_station":
+                    police_station.strip(),
 
-st.subheader('🗑 Delete Cases')
+                "filing_date":
+                    filing_date,
 
-delete_stage = st.selectbox(
+                "first_hearing_date":
+                    first_hearing_date,
 
-    'Delete Cases By Stage',
+                "decision_date":
+                    decision_date,
 
-    sorted(df['stage_of_case'].unique())
+                "case_status":
+                    case_status,
 
+                "disposal_type":
+                    None,
+
+                "source_type":
+                    "PDF_OCR"
+            }
+
+            # =================================================
+            # INSERT INTO POSTGRESQL
+            # =================================================
+
+            try:
+
+                new_case_id = add_case(
+                    case_data
+                )
+
+                st.success(
+                    "✅ Extracted case added successfully to PostgreSQL."
+                )
+
+                st.info(
+                    f"Case ID: {new_case_id}"
+                )
+
+                st.cache_data.clear()
+
+            except Exception as exc:
+
+                st.error(
+                    "Unable to save extracted case to PostgreSQL."
+                )
+
+                st.exception(exc)
+
+
+# ============================================================
+# END
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "Case registration and extracted case data are stored in "
+    "PostgreSQL. XGBoost provides duration and delay-risk "
+    "predictions, while SHAP provides model explanations."
 )
-
-if st.button('Delete Cases'):
-
-    latest_df = preprocess_data(
-        'cleaned_cases.csv'
-    )
-
-    updated_df = latest_df[
-        latest_df['stage_of_case'] != delete_stage
-    ]
-
-    updated_df.to_csv(
-        'cleaned_cases.csv',
-        index=False
-    )
-
-    st.success(
-        'Cases deleted successfully.'
-    )

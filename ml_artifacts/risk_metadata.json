@@ -1,0 +1,11 @@
+{
+    "model": "XGBClassifier",
+    "training_rows": 5000,
+    "accuracy": 0.938,
+    "weighted_f1": 0.9380420919943379,
+    "classes": [
+        "High",
+        "Low",
+        "Medium"
+    ]
+}

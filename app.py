@@ -1,544 +1,473 @@
 import streamlit as st
+import pandas as pd
 import plotly.express as px
 
-from preprocessing import preprocess_data
+from database.repository import get_cases
+from ml.predict import predict_dataframe
 
-# =====================================================
+
+# ============================================================
 # PAGE CONFIG
-# =====================================================
+# ============================================================
 
 st.set_page_config(
-    page_title='Judicial Delay Intelligence System',
-    layout='wide'
+    page_title="Judicial Intelligence Dashboard",
+    page_icon="⚖️",
+    layout="wide"
 )
 
-# =====================================================
-# CUSTOM UI
-# =====================================================
 
-st.markdown("""
-<style>
-
-.main {
-    background-color: #0E1117;
-    color: white;
-}
-
-[data-testid="stMetric"] {
-    background-color: #1E1E1E;
-    padding: 15px;
-    border-radius: 12px;
-    border: 1px solid #333;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-# =====================================================
-# LOAD DATA
-# =====================================================
-
-df = preprocess_data('cleaned_cases.csv')
-
-# =====================================================
+# ============================================================
 # HEADER
-# =====================================================
+# ============================================================
 
-st.title('⚖ Judicial Delay Intelligence System')
+st.title(
+    "⚖️ Judicial Intelligence Dashboard"
+)
 
 st.markdown(
-    '### Karnataka Judiciary Pendency & Bottleneck Analytics'
+    "### Karnataka Judiciary — Data Analytics & ML-Based Case Intelligence"
 )
 
-# =====================================================
-# SIDEBAR FILTERS
-# =====================================================
+st.caption(
+    "Interactive analysis of judicial case data using "
+    "PostgreSQL and XGBoost-based predictions."
+)
 
-st.sidebar.header('Dashboard Filters')
+
+# ============================================================
+# LOAD DATA FROM POSTGRESQL
+# ============================================================
+
+try:
+
+    df = get_cases()
+
+except Exception as exc:
+
+    st.error(
+        "PostgreSQL connection failed."
+    )
+
+    st.exception(exc)
+
+    st.stop()
+
+
+if df.empty:
+
+    st.warning(
+        "No cases available in PostgreSQL."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# XGBOOST PREDICTIONS
+# ============================================================
+
+try:
+
+    df = predict_dataframe(df)
+
+except Exception as exc:
+
+    st.error(
+        "Unable to generate XGBoost predictions."
+    )
+
+    st.code(
+        "python -m ml.train"
+    )
+
+    st.exception(exc)
+
+    st.stop()
+
+
+# ============================================================
+# CLEAN DATA
+# ============================================================
+
+df["district_name"] = (
+    df["district_name"]
+    .fillna("Unknown")
+    .astype(str)
+)
+
+df["stage_of_case"] = (
+    df["stage_of_case"]
+    .fillna("Unknown")
+    .astype(str)
+)
+
+df["predicted_risk"] = (
+    df["predicted_risk"]
+    .fillna("Unknown")
+    .astype(str)
+)
+
+df["predicted_duration_years"] = pd.to_numeric(
+    df["predicted_duration_years"],
+    errors="coerce"
+).fillna(0)
+
+df["hearing_gap_days"] = pd.to_numeric(
+    df.get("hearing_gap_days", 0),
+    errors="coerce"
+).fillna(0)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header(
+    "🔎 Dashboard Filters"
+)
+
+
+districts = sorted(
+    df["district_name"]
+    .unique()
+    .tolist()
+)
+
 
 selected_districts = st.sidebar.multiselect(
-    'Select District',
-    sorted(df['district_name'].unique()),
-    default=sorted(df['district_name'].unique())
+
+    "District",
+
+    districts,
+
+    default=districts
 )
 
-selected_risk = st.sidebar.multiselect(
-    'Select Risk',
-    ['Low', 'Medium', 'High'],
-    default=['Low', 'Medium', 'High']
-)
 
-filtered_df = df[
-    (df['district_name'].isin(selected_districts)) &
-    (df['calculated_risk'].isin(selected_risk))
-]
+selected_risks = st.sidebar.multiselect(
 
-# =====================================================
-# KPI SECTION
-# =====================================================
+    "Predicted Risk Level",
 
-st.subheader('📌 Dashboard Overview')
+    [
+        "Low",
+        "Medium",
+        "High"
+    ],
 
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-
-    st.metric(
-        'Total Cases',
-        len(filtered_df)
-    )
-
-with col2:
-
-    st.metric(
-        'Average Delay',
-        f"{round(filtered_df['case_age_days'].mean())} Days"
-    )
-
-with col3:
-
-    st.metric(
-        'High Risk Cases',
-        len(
-            filtered_df[
-                filtered_df['calculated_risk'] == 'High'
-            ]
-        )
-    )
-
-with col4:
-
-    st.metric(
-        'Long Pending Cases',
-        len(
-            filtered_df[
-                filtered_df['long_pending'] == True
-            ]
-        )
-    )
-
-# =====================================================
-# DISTRICT PENDENCY
-# =====================================================
-
-st.subheader('📊 District-wise Pendency')
-
-pendency = (
-
-    filtered_df['district_name']
-    .value_counts()
-    .reset_index()
-
-)
-
-pendency.columns = [
-
-    'District',
-
-    'Cases'
-
-]
-
-fig1 = px.bar(
-
-    pendency,
-
-    x='District',
-
-    y='Cases',
-
-    color='Cases',
-
-    text='Cases'
-
-)
-
-st.plotly_chart(
-    fig1,
-    use_container_width=True
-)
-
-# =====================================================
-# STAGE-WISE DELAY ANALYSIS
-# =====================================================
-
-st.subheader('⚠ Stage-wise Delay Analysis')
-
-stage_delay = (
-
-    filtered_df.groupby('stage_of_case')[
-        'case_age_days'
+    default=[
+        "Low",
+        "Medium",
+        "High"
     ]
-    .mean()
+)
+
+
+# ============================================================
+# APPLY FILTERS
+# ============================================================
+
+filtered = df[
+    df["district_name"].isin(
+        selected_districts
+    )
+    &
+    df["predicted_risk"].isin(
+        selected_risks
+    )
+].copy()
+
+
+if filtered.empty:
+
+    st.warning(
+        "No cases match the selected filters."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# OVERVIEW KPIs
+# ============================================================
+
+st.subheader(
+    "📌 Dashboard Overview"
+)
+
+
+c1, c2, c3, c4 = st.columns(4)
+
+
+with c1:
+
+    st.metric(
+        "Total Cases",
+        f"{len(filtered):,}"
+    )
+
+
+with c2:
+
+    high_risk = int(
+        (
+            filtered["predicted_risk"]
+            == "High"
+        ).sum()
+    )
+
+    st.metric(
+        "High-Risk Cases",
+        f"{high_risk:,}"
+    )
+
+
+with c3:
+
+    avg_duration = (
+        filtered[
+            "predicted_duration_years"
+        ].mean()
+    )
+
+    st.metric(
+        "Avg. Predicted Duration",
+        f"{avg_duration:.2f} years"
+    )
+
+
+with c4:
+
+    avg_gap = (
+        filtered[
+            "hearing_gap_days"
+        ].mean()
+    )
+
+    st.metric(
+        "Avg. Hearing Gap",
+        f"{avg_gap:.0f} days"
+    )
+
+
+# ============================================================
+# 1. CASE DISTRIBUTION
+# ============================================================
+
+st.subheader(
+    "📊 Case Distribution by District"
+)
+
+
+district_cases = (
+
+    filtered[
+        "district_name"
+    ]
+
+    .value_counts()
+
     .reset_index()
-
 )
 
-fig2 = px.bar(
 
-    stage_delay,
-
-    x='stage_of_case',
-
-    y='case_age_days',
-
-    color='case_age_days',
-
-    text='case_age_days'
-
-)
-
-st.plotly_chart(
-    fig2,
-    use_container_width=True
-)
-
-# =====================================================
-# HEATMAP
-# =====================================================
-
-st.subheader('🔥 District vs Stage Delay Heatmap')
-
-heatmap_data = filtered_df.pivot_table(
-
-    values='case_age_days',
-
-    index='district_name',
-
-    columns='stage_of_case',
-
-    aggfunc='mean'
-
-)
-
-fig3 = px.imshow(
-
-    heatmap_data,
-
-    text_auto=True,
-
-    aspect='auto'
-
-)
-
-st.plotly_chart(
-    fig3,
-    use_container_width=True
-)
-
-# =====================================================
-# HEARING GAP ANALYSIS
-# =====================================================
-
-st.subheader('📅 Hearing Gap Analysis')
-
-gap_df = filtered_df.copy()
-
-# Replace zero gaps with median
-valid_gaps = gap_df[
-    gap_df['hearing_gap_days'] > 0
+district_cases.columns = [
+    "District",
+    "Cases"
 ]
 
-if len(valid_gaps) > 0:
 
-    median_gap = valid_gaps[
-        'hearing_gap_days'
-    ].median()
+fig = px.bar(
 
-else:
+    district_cases,
 
-    median_gap = 30
+    x="District",
 
-gap_df['hearing_gap_days'] = gap_df[
-    'hearing_gap_days'
-].replace(0, median_gap)
+    y="Cases",
 
-fig4 = px.box(
+    text="Cases",
 
-    gap_df,
-
-    x='district_name',
-
-    y='hearing_gap_days',
-
-    color='district_name'
+    title="Number of Cases by District"
 
 )
 
+
+fig.update_traces(
+    textposition="outside"
+)
+
+
+fig.update_layout(
+
+    xaxis_title="District",
+
+    yaxis_title="Number of Cases"
+
+)
+
+
 st.plotly_chart(
-    fig4,
+    fig,
     use_container_width=True
 )
 
-# =====================================================
-# DISTRICT HEALTH SCORE
-# =====================================================
 
-st.subheader('🏥 District Health Score')
+# ============================================================
+# 2. OVERALL RISK DISTRIBUTION
+# ============================================================
 
-health = (
+st.subheader(
+    "🤖 Predicted Case Risk Distribution"
+)
 
-    filtered_df.groupby('district_name')
-    .agg({
 
-        'case_age_days': 'mean',
+risk = (
 
-        'hearing_gap_days': 'mean',
+    filtered[
+        "predicted_risk"
+    ]
 
-        'priority_score': 'mean'
+    .value_counts()
 
-    })
+    .reindex(
+        [
+            "Low",
+            "Medium",
+            "High"
+        ],
+        fill_value=0
+    )
+
     .reset_index()
+)
+
+
+risk.columns = [
+    "Risk Level",
+    "Cases"
+]
+
+
+fig = px.pie(
+
+    risk,
+
+    names="Risk Level",
+
+    values="Cases",
+
+    title="Distribution Across Predicted Risk Levels"
 
 )
 
-health['Health Score'] = (
 
-    health['case_age_days'] * 0.4 +
+fig.update_traces(
 
-    health['hearing_gap_days'] * 0.3 +
+    textposition="inside",
 
-    health['priority_score'] * 0.3
-
-)
-
-fig5 = px.bar(
-
-    health,
-
-    x='district_name',
-
-    y='Health Score',
-
-    color='Health Score',
-
-    text='Health Score'
+    textinfo="percent+label"
 
 )
+
 
 st.plotly_chart(
-    fig5,
+
+    fig,
+
     use_container_width=True
+
 )
 
-# =====================================================
-# PRIORITY CASES
-# =====================================================
 
-st.subheader('🚨 Priority Cases')
+# ============================================================
+# 3. PREDICTED DURATION BY DISTRICT
+# ============================================================
 
-priority_cases = filtered_df.sort_values(
+st.subheader(
+    "📅 Predicted Case Duration by District"
+)
 
-    by='priority_score',
+
+duration = (
+
+    filtered
+
+    .groupby(
+        "district_name"
+    )[
+
+        "predicted_duration_years"
+
+    ]
+
+    .mean()
+
+    .reset_index()
+)
+
+
+duration.columns = [
+    "District",
+    "Predicted Duration (Years)"
+]
+
+
+duration = duration.sort_values(
+
+    "Predicted Duration (Years)",
 
     ascending=False
 
-).head(10)
-
-columns = [
-
-    'district_name',
-
-    'court_name',
-
-    'stage_of_case',
-
-    'case_age_days',
-
-    'hearing_gap_days',
-
-    'calculated_risk',
-
-    'priority_score',
-
-    'delay_explanation'
-
-]
-
-available_columns = [
-
-    col for col in columns
-    if col in priority_cases.columns
-
-]
-
-st.dataframe(
-    priority_cases[available_columns]
 )
 
-# =====================================================
-# BOTTLENECK DETECTION
-# =====================================================
 
-st.subheader('🚧 Bottleneck Detection')
+fig = px.bar(
 
-inactive_stages = [
+    duration,
 
-    'Disposed',
-    'Disposed Otherwise',
-    'Dismissed',
-    'Dismissed For Default',
-    'Closed',
-    'Judgment'
+    x="District",
 
-]
+    y="Predicted Duration (Years)",
 
-active_df = filtered_df.copy()
+    text="Predicted Duration (Years)",
 
-# Normalize text
-active_df['stage_of_case'] = active_df[
-    'stage_of_case'
-].astype(str).str.strip().str.upper()
+    title="Average Predicted Case Duration by District"
 
-inactive_stages = [
-
-    'DISPOSED',
-    'DISPOSED OTHERWISE',
-    'DISMISSED',
-    'DISMISSED FOR DEFAULT',
-    'CLOSED',
-    'JUDGMENT'
-
-]
-
-# Remove inactive stages
-active_df = active_df[
-    ~active_df['stage_of_case']
-    .isin(inactive_stages)
-]
-
-# Remove invalid delays only
-active_df = active_df[
-    active_df['case_age_days'] > 0
-]
-
-# Replace zero hearing gaps with median
-valid_gaps = active_df[
-    active_df['hearing_gap_days'] > 0
-]
-
-if len(valid_gaps) > 0:
-
-    median_gap = valid_gaps[
-        'hearing_gap_days'
-    ].median()
-
-else:
-
-    median_gap = 30
-
-active_df['hearing_gap_days'] = active_df[
-    'hearing_gap_days'
-].replace(0, median_gap)
-
-if len(active_df) == 0:
-
-    st.warning(
-        'No valid active bottleneck stages found.'
-    )
-
-else:
-
-    bottleneck = (
-
-        active_df.groupby('stage_of_case')
-        .agg({
-
-            'case_age_days': 'mean',
-
-            'hearing_gap_days': 'mean'
-
-        })
-        .reset_index()
-
-    )
-
-    pending_counts = (
-
-        active_df['stage_of_case']
-        .value_counts()
-        .reset_index()
-
-    )
-
-    pending_counts.columns = [
-
-        'stage_of_case',
-
-        'pending_count'
-
-    ]
-
-    bottleneck = bottleneck.merge(
-
-        pending_counts,
-
-        on='stage_of_case'
-
-    )
-
-    bottleneck['Bottleneck Score'] = (
-
-        bottleneck['case_age_days'] * 0.4 +
-
-        bottleneck['hearing_gap_days'] * 0.4 +
-
-        bottleneck['pending_count'] * 0.2
-
-    )
-
-    worst_stage = bottleneck.sort_values(
-
-        by='Bottleneck Score',
-
-        ascending=False
-
-    ).iloc[0]
-
-    st.error(
-
-        f"""
-        {worst_stage['stage_of_case']} stage acts as the primary active bottleneck.
-
-        Average Delay:
-        {round(worst_stage['case_age_days'])} days
-
-        Average Hearing Gap:
-        {round(worst_stage['hearing_gap_days'])} days
-
-        Pending Cases:
-        {round(worst_stage['pending_count'])}
-        """
-
-    )
-
-# =====================================================
-# KEY INSIGHTS
-# =====================================================
-
-st.subheader('📌 Key Insights')
-
-highest_district = pendency.iloc[0]['District']
-
-st.success(
-    f"{highest_district} has the highest pendency concentration."
 )
 
-if len(active_df) > 0:
 
-    st.warning(
-        f"""
-        Most delays currently accumulate during
-        {worst_stage['stage_of_case']} stage.
-        """
-    )
+fig.update_traces(
 
-# =====================================================
+    texttemplate="%{text:.2f} years",
+
+    textposition="outside"
+
+)
+
+
+fig.update_layout(
+
+    xaxis_title="District",
+
+    yaxis_title="Predicted Duration (Years)"
+
+)
+
+
+st.plotly_chart(
+
+    fig,
+
+    use_container_width=True
+
+)
+
+
+# ============================================================
 # FOOTER
-# =====================================================
-
-st.markdown('---')
+# ============================================================
 
 st.caption(
-    'Judicial Delay Intelligence & Decision Support System'
+    "Predictions are generated by trained XGBoost models "
+    "using case data retrieved from PostgreSQL."
 )
