@@ -1,21 +1,16 @@
 import os
+from dotenv import load_dotenv
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_HOST = os.getenv("DB_HOST", "192.168.41.97")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "judiciary_db")
+load_dotenv()
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DATABASE_URL = (
-    f"postgresql+psycopg2://"
-    f"{DB_USER}:{DB_PASSWORD}@"
-    f"{DB_HOST}:{DB_PORT}/{DB_NAME}"
-)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
 
 engine = create_engine(
