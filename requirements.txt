@@ -22,6 +22,4 @@ pdf2image
 
 pytest
 python-dotenv
-psycopg
-psycopg2-binary
 psycopg[binary]
